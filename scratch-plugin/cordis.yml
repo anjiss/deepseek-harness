@@ -1,0 +1,11 @@
+- insert:
+    - id: hello
+      name: '/home/SENSETIME/anjisi/deepseek-harness/scratch-plugin/src/my-plugin.ts'
+      config:
+        greeting: '咳咳 这里是播音室 现在庄严播报'
+    - id: train-consistency
+      name: '/home/SENSETIME/anjisi/deepseek-harness/scratch-plugin/src/train-consistency-analyze.ts'
+    - id: session-observe
+      name: '/home/SENSETIME/anjisi/deepseek-harness/scratch-plugin/src/session-observe.ts'
+    - id: train-throughput
+      name: '/home/SENSETIME/anjisi/deepseek-harness/scratch-plugin/src/train-throughput-analyze.ts'

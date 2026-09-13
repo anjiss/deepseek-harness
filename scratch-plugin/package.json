@@ -1,0 +1,8 @@
+{
+  "name": "dsh-scratch-session-observe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.55.0"
+  }
+}
