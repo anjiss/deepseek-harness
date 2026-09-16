@@ -106,9 +106,11 @@ const TERMINAL_OK = new Set(['SUCCEEDED'])
 const TERMINAL_BAD = new Set(['FAILED', 'DELETED', 'SUSPENDED'])
 const WATCH_INTERVAL_MS = 20_000
 // Budget is measured from launch, so queueing for idle GPUs does not eat into compare time.
-const WATCH_BUDGET_MS = 4 * 60 * 60 * 1000
+// 2026-09-14 人指定：去掉 4 小时观察上限，让 A/B 正常训练下去（本轮设为 8h）
+const WATCH_BUDGET_MS = 8 * 60 * 60 * 1000
 const QUEUE_WAIT_MS = 20 * 60 * 1000
-const NO_STEP_MS = 20 * 60 * 1000
+// 2 节点初始化慢：把「很久没有 step 就停」放宽到 40 分钟
+const NO_STEP_MS = 40 * 60 * 1000
 const STOP_TIMEOUT_MS = 60_000
 const DEFAULT_GPUS_PER_JOB = 8
 const FIXED_RESOURCE_GROUP = 'iag-v-ganzhi'
@@ -304,9 +306,8 @@ function inspectLaunchCommand(command: string): string | null {
   if (!targetsFixed || OTHER_QUEUE.test(command)) {
     return `launch_command must submit only to ${FIXED_WORKSPACE}; do not fall back to muxi.`
   }
-  if (!/CUDA_LAUNCH_BLOCKING=1/.test(command) && !/CUDA_LAUNCH_BLOCKING:1/.test(command)) {
-    return 'launch_command must set CUDA_LAUNCH_BLOCKING=1 (export in CMD and/or --env).'
-  }
+  // 2026-09-14 人指定：本轮要在**不加** CUDA_LAUNCH_BLOCKING 的口径下做 A/B，故不再强制校验。
+  // 原逻辑（需要回退时用）：命令里既没有 export CUDA_LAUNCH_BLOCKING=1 也没有 --env CUDA_LAUNCH_BLOCKING:1 就拒绝。
   return null
 }
 

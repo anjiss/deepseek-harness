@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -12,7 +11,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'session-observe'
-export const inject = ['tools', 'agents', 'apiProxy', 'workspaceRegistry']
+export const inject = ['tools', 'agents', 'sessionController', 'workspaceRegistry']
 
 export interface Config {
   sessionId: string
@@ -166,6 +165,13 @@ function asText(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
+function inboxQueueLength(inbox: unknown, camel: 'nextTurn' | 'nextStep', kebab: 'next-turn' | 'next-step'): number {
+  if (!inbox || typeof inbox !== 'object') return 0
+  const record = inbox as Record<string, unknown>
+  const queue = record[camel] ?? record[kebab]
+  return Array.isArray(queue) ? queue.length : 0
+}
+
 function clip(text: string, cap = FEISHU_TEXT_CAP): string {
   if (text.length <= cap) return text
   return `${text.slice(0, cap - 1)}…`
@@ -199,9 +205,14 @@ function visibleText(blocks: ContentBlock[]): string {
     .join('\n')
 }
 
+function eventsOf(session: Session): readonly SessionEvent[] {
+  return session.snapshotEvents()
+}
+
 function titleOf(session: Session): string {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]!
+  const events = eventsOf(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
     if (String(event.type) !== 'session/title') continue
     const title = (event.data as { title?: unknown }).title
     if (typeof title === 'string' && title.trim()) return title.trim()
@@ -211,8 +222,9 @@ function titleOf(session: Session): string {
 
 function toolName(session: Session, callId: unknown): string {
   if (typeof callId !== 'string') return 'tool'
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]!
+  const events = eventsOf(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
     if (event.type !== 'tool/call') continue
     if (event.data.callId === callId) return event.data.name
   }
@@ -232,15 +244,16 @@ function toolSummary(session: Session, event: Extract<SessionEvent, { type: 'too
 }
 
 function lastOf<T extends SessionEvent['type']>(session: Session, type: T): Extract<SessionEvent, { type: T }> | undefined {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]!
+  const events = eventsOf(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
     if (event.type === type) return event as Extract<SessionEvent, { type: T }>
   }
   return undefined
 }
 
 function snapshotOf(agent: Agent | undefined, session: Session | undefined): SessionSnapshot {
-  const events = session?.events ?? []
+  const events = session ? eventsOf(session) : []
   let progress: string | null = null
   let lastAssistant: string | null = null
   let lastTool: string | null = null
@@ -271,8 +284,8 @@ function snapshotOf(agent: Agent | undefined, session: Session | undefined): Ses
     last_assistant: lastAssistant,
     last_tool: lastTool,
     last_turn_reason: turnEnd ? String(turnEnd.data.reason.kind) : null,
-    inbox_next_turn: agent?.inbox.nextTurn.length ?? 0,
-    inbox_next_step: agent?.inbox.nextStep.length ?? 0,
+    inbox_next_turn: inboxQueueLength(agent?.inbox, 'nextTurn', 'next-turn'),
+    inbox_next_step: inboxQueueLength(agent?.inbox, 'nextStep', 'next-step'),
   }
 }
 
@@ -318,8 +331,9 @@ function formatFeishuWatch(value: SessionSnapshot): string {
 
 function commandOfCall(session: Session, callId: unknown): string | null {
   if (typeof callId !== 'string' || !callId) return null
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]!
+  const events = eventsOf(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
     if (event.type !== 'tool/call') continue
     if (event.data.callId !== callId) continue
     try {
@@ -344,8 +358,9 @@ function unansweredAsk(session: Session): {
   callId?: string
 } | null {
   const decided = new Set<string>()
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]!
+  const events = eventsOf(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
     const data = eventRecord(event)
     if (String(event.type) === 'approval/decided') {
       if (typeof data.id === 'string') decided.add(data.id)
@@ -411,35 +426,29 @@ type ApprovalOutcome = 'allowed-once' | 'rejected'
 type PendingApprovalSlot = {
   sessionId: string
   approvalId?: string
-  rpcId?: string
   toolName: string
   reason?: string
   command?: string
   queued?: ApprovalOutcome
+  settle?: (outcome: ApprovalOutcome) => void
 }
 
-type ApiProxyFace = {
-  events: {
-    mux: (
-      request: { rpcId: string, payload: Record<string, never> },
-      signal: AbortSignal,
-    ) => AsyncIterable<{ rpcId: string, payload: Record<string, unknown> & { type: string } }>
-  }
-  respond: (message: {
-    type: 'client-response'
-    rpcId: string
-    result: { ok: true, value: { sessionId: string, approvalId: string, outcome: ApprovalOutcome } }
-  }) => Promise<{ accepted: boolean, reason?: string }>
-  sessions: {
-    create: (request: {
-      rpcId: string
-      payload: { cwd?: string, sessionId?: string, workspaceId?: string, agentPreset?: string }
-    }) => Promise<{ result?: { ok?: boolean, value?: { sessionId?: string }, error?: { message?: string } } }>
-    rename: (request: {
-      rpcId: string
-      payload: { sessionId: string, title: string }
-    }) => Promise<unknown>
-  }
+type SessionControllerFace = {
+  create: (request: {
+    cwd?: string
+    sessionId?: string
+    workspaceId?: string
+    agentPreset?: string
+  }) => Promise<{ sessionId: string, agentPreset?: string }>
+  rename: (request: { sessionId: string, title: string }) => Promise<unknown>
+}
+
+type ApprovalRequestFace = {
+  agent?: { id?: string }
+  toolName?: string
+  callId?: string
+  reason?: string
+  signal?: AbortSignal
 }
 
 type WorkspaceFace = {
@@ -496,7 +505,7 @@ function formatSpawned(value: SpawnedSession): string {
 }
 
 export function apply(ctx: Context, config: Config) {
-  const apiProxy = (ctx as Context & { apiProxy: ApiProxyFace }).apiProxy
+  const sessionController = (ctx as Context & { sessionController: SessionControllerFace }).sessionController
   const workspaceRegistry = (ctx as Context & {
     workspaceRegistry: WorkspaceRegistryFace
   }).workspaceRegistry
@@ -546,8 +555,8 @@ export function apply(ctx: Context, config: Config) {
     title: titleOf(agent.session),
     status: agent.status,
     cwd: agent.session.header.cwd ?? null,
-    inbox_next_turn: agent.inbox.nextTurn.length,
-    inbox_next_step: agent.inbox.nextStep.length,
+    inbox_next_turn: inboxQueueLength(agent.inbox, 'nextTurn', 'next-turn'),
+    inbox_next_step: inboxQueueLength(agent.inbox, 'nextStep', 'next-step'),
     watching: agent.id === watched,
   })
 
@@ -675,43 +684,14 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const submitApproval = async (slot: PendingApprovalSlot, outcome: ApprovalOutcome): Promise<{ text: string, react?: string }> => {
-    if (!slot.rpcId || !slot.approvalId) {
+    if (!slot.settle) {
       slot.queued = outcome
       return { text: '', react: FEISHU_ACK_EMOJI }
     }
-    const receipt = await apiProxy.respond({
-      type: 'client-response',
-      rpcId: slot.rpcId,
-      result: {
-        ok: true,
-        value: { sessionId: slot.sessionId, approvalId: slot.approvalId, outcome },
-      },
-    })
-    if (!receipt.accepted) {
-      return { text: `审批没送到网页通道：${receipt.reason ?? 'unknown'}` }
-    }
+    const settle = slot.settle
+    slot.settle = undefined
+    settle(outcome)
     return { text: '', react: FEISHU_ACK_EMOJI }
-  }
-
-  const attachRpc = (sessionId: string, approvalId: string, rpcId: string): void => {
-    let slot = pendingApprovals.find(item => item.approvalId === approvalId)
-      ?? pendingApprovals.find(item => item.sessionId === sessionId && !item.rpcId)
-    if (!slot) {
-      slot = { sessionId, approvalId, rpcId, toolName: '' }
-      pendingApprovals.push(slot)
-    } else {
-      slot.approvalId = approvalId
-      slot.rpcId = rpcId
-    }
-    if (!slot.queued) return
-    const queued = slot.queued
-    slot.queued = undefined
-    void submitApproval(slot, queued).catch((error: unknown) => {
-      ctx.logger.warn(
-        'session-observe: queued approval respond failed: %s',
-        error instanceof Error ? error.message : String(error),
-      )
-    })
   }
 
   const answerApproval = async (outcome: ApprovalOutcome): Promise<{ text: string, react?: string }> => {
@@ -721,7 +701,7 @@ export function apply(ctx: Context, config: Config) {
       const agent = live(id)
       const ask = agent ? unansweredAsk(agent.session) : null
       if (ask) {
-        return { text: '这次审批还停在网页通道里，飞书这边接不上，请到网页点允许或拒绝。' }
+        return { text: '审批还在等飞书通道接上，请稍后再发一次批准或拒绝。' }
       }
     }
     return { text: '当前没有等待审批。' }
@@ -774,21 +754,17 @@ export function apply(ctx: Context, config: Config) {
       cwd: live(watched)?.session.header.cwd ?? process.cwd(),
     }
     if (talker) payload.sessionId = talker
-    const created = await apiProxy.sessions.create({
-      rpcId: randomUUID(),
-      payload,
-    })
-    const id = created.result?.value?.sessionId
-    if (!created.result?.ok || !id) {
-      throw new Error(created.result?.error?.message || 'failed to start feishu talker session')
+    let id: string
+    try {
+      id = (await sessionController.create(payload)).sessionId
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'failed to start feishu talker session')
     }
+    if (!id) throw new Error('failed to start feishu talker session')
     talker = id
     saveTalkerId(id)
     const agent = requireLive(id, 'talk')
-    void apiProxy.sessions.rename({
-      rpcId: randomUUID(),
-      payload: { sessionId: id, title: TALKER_TITLE },
-    }).catch(() => { /* title is best-effort */ })
+    void sessionController.rename({ sessionId: id, title: TALKER_TITLE }).catch(() => { /* title is best-effort */ })
     return agent
   }
 
@@ -881,20 +857,16 @@ export function apply(ctx: Context, config: Config) {
     const payload: { workspaceId: string, agentPreset?: string } = { workspaceId: workspace.id }
     const preset = source?.session.header.agentPreset
     if (preset) payload.agentPreset = preset
-    const created = await apiProxy.sessions.create({
-      rpcId: randomUUID(),
-      payload,
-    })
-    const id = created.result?.value?.sessionId
-    if (!created.result?.ok || !id) {
-      throw new Error(created.result?.error?.message || `failed to spawn session in workspace ${workspace.id}`)
+    let id: string
+    try {
+      id = (await sessionController.create(payload)).sessionId
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : `failed to spawn session in workspace ${workspace.id}`)
     }
+    if (!id) throw new Error(`failed to spawn session in workspace ${workspace.id}`)
     const title = options.title?.trim()
     if (title) {
-      await apiProxy.sessions.rename({
-        rpcId: randomUUID(),
-        payload: { sessionId: id, title },
-      }).catch(() => { /* title is best-effort */ })
+      await sessionController.rename({ sessionId: id, title }).catch(() => { /* title is best-effort */ })
     }
     const agent = requireLive(id, 'spawn')
     const prompt = options.prompt?.trim() ?? ''
@@ -1008,31 +980,37 @@ export function apply(ctx: Context, config: Config) {
     }
   })
 
-  ctx.effect(() => {
-    const abort = new AbortController()
-    void (async () => {
-      try {
-        for await (const envelope of apiProxy.events.mux({ rpcId: randomUUID(), payload: {} }, abort.signal)) {
-          const payload = envelope.payload
-          if (payload.type === 'approval/requested'
-            && typeof payload.sessionId === 'string'
-            && typeof payload.approvalId === 'string') {
-            attachRpc(payload.sessionId, payload.approvalId, envelope.rpcId)
+  ctx.on(
+    'approval/request',
+    (req: ApprovalRequestFace, next: () => Promise<ApprovalOutcome>) => {
+      const sessionId = typeof req.agent?.id === 'string' ? req.agent.id : ''
+      if (!sessionId || (sessionId !== talker && sessionId !== watched)) return next()
+      return new Promise<ApprovalOutcome>((resolve) => {
+        let slot = pendingFor(sessionId)
+        if (!slot || slot.settle) {
+          slot = {
+            sessionId,
+            toolName: req.toolName ?? '',
+            ...req.reason === undefined ? {} : { reason: req.reason },
           }
-          if (payload.type === 'approval/resolved' && typeof payload.approvalId === 'string') {
-            removePending(payload.approvalId)
-          }
+          pendingApprovals.push(slot)
         }
-      } catch (error: unknown) {
-        if (abort.signal.aborted) return
-        ctx.logger.warn(
-          'session-observe: approval mux failed: %s',
-          error instanceof Error ? error.message : String(error),
-        )
-      }
-    })()
-    return () => abort.abort()
-  }, 'session-observe: approval mux')
+        const settle = (outcome: ApprovalOutcome): void => {
+          if (!slot.settle) return
+          slot.settle = undefined
+          resolve(outcome)
+        }
+        slot.settle = settle
+        if (slot.queued) {
+          const queued = slot.queued
+          slot.queued = undefined
+          settle(queued)
+          return
+        }
+        req.signal?.addEventListener('abort', () => settle('cancelled'), { once: true })
+      })
+    },
+  )
 
   const renderSnapshot = (_args: unknown, value: SessionSnapshot) => [{ type: 'text' as const, text: formatSnapshot(value) }]
   const renderList = (_args: unknown, value: SessionBrief[]) => [{
