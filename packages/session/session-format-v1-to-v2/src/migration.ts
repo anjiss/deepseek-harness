@@ -70,6 +70,9 @@ class TransformedReleasedV1ToV2Stage implements SessionFormatMigrationStage {
       targetSeq: 0,
       targetCut: input.sourceHeader.isSeeded ? undefined : 0,
       lastTime: input.sourceHeader.createdAt,
+      lastClosedAssistantTargetSeq: undefined,
+      lastClosedAssistantTurn: undefined,
+      lastClosedAssistantStep: undefined,
     }
   }
 
@@ -119,6 +122,9 @@ interface ReleasedV1ToV2State {
   targetSeq: number
   targetCut: number | undefined
   lastTime: number
+  lastClosedAssistantTargetSeq: number | undefined
+  lastClosedAssistantTurn: number | undefined
+  lastClosedAssistantStep: number | undefined
 }
 
 function transformReleasedEvent(
@@ -274,30 +280,74 @@ function transformMessage(
   const pending = state.pending
   if (pending !== undefined && (pending.group.turn !== turn || pending.group.step !== step)) {
     finishAttempt(state, context)
-    emitSource(state, messageEvent(event, attemptGroup(turn, step)), context)
+    emitClosedAssistant(state, event, attemptGroup(turn, step), context)
     return
   }
   if (!Array.isArray(sources)) {
     if (pending !== undefined) {
       throw refusal(`assistant/message ${event.seq} does not cite its complete v1 chunk attempt`)
     }
-    emitSource(state, messageEvent(event, attemptGroup(turn, step)), context)
+    // v0 streamed the same assistant bubble as successive append snapshots
+    // after the chunk attempt was already closed. Fold them into the closed
+    // message so v3 does not receive assistant/message replacements.
+    if (aliasClosedAssistantSnapshot(state, event, turn, step)) return
+    emitClosedAssistant(state, event, attemptGroup(turn, step), context)
     return
   }
   if (sources.length === 0) {
     finishAttempt(state, context)
-    emitSource(state, messageEvent(event, attemptGroup(turn, step)), context)
+    emitClosedAssistant(state, event, attemptGroup(turn, step), context)
     return
   }
-  if (pending === undefined
-    || !matchesChunkSources(pending.group, sources)) {
+  // v0 surface replacement also stores sourceEventSeqs, but those cite earlier
+  // assistant/message rows rather than the chunk attempt. After the attempt is
+  // already closed, fold the replacement into that message: v3 forbids
+  // assistant/message sourceEventSeqs, so a replace cannot satisfy applySurface.
+  if (pending === undefined) {
+    if (aliasClosedAssistantSnapshot(state, event, turn, step)) return
+    emitClosedAssistant(state, event, attemptGroup(turn, step), context)
+    return
+  }
+  if (!matchesChunkSources(pending.group, sources)) {
     throw refusal(`assistant/message ${event.seq} chunk provenance is not one complete ordered attempt`)
   }
   assertAttemptCut(state, pending.group, event.seq)
   pending.group.terminal = true
   flushBuffered(state, pending, context)
-  emitSource(state, messageEvent(event, pending.group), context)
+  emitClosedAssistant(state, event, pending.group, context)
   state.pending = undefined
+}
+
+function emitClosedAssistant(
+  state: ReleasedV1ToV2State,
+  event: SessionFormatEvent,
+  group: AttemptGroup,
+  context: SessionFormatMigrationContext,
+): void {
+  // v3 forbids assistant/message sourceEventSeqs, so replacements cannot
+  // satisfy applySurface. Keep one append; fold later snapshots onto it.
+  emitSource(state, { ...messageEvent(event, group), surfaceOp: 'append' }, context)
+  state.lastClosedAssistantTargetSeq = state.targetSeq - 1
+  state.lastClosedAssistantTurn = group.turn
+  state.lastClosedAssistantStep = group.step
+}
+
+function aliasClosedAssistantSnapshot(
+  state: ReleasedV1ToV2State,
+  event: SessionFormatEvent,
+  turn: number,
+  step: number,
+): boolean {
+  if (
+    state.lastClosedAssistantTargetSeq === undefined ||
+    state.lastClosedAssistantTurn !== turn ||
+    state.lastClosedAssistantStep !== step
+  ) {
+    return false
+  }
+  // v0 streaming snapshots often mint a new message id for the same bubble.
+  state.mapping.set(event.seq, state.lastClosedAssistantTargetSeq)
+  return true
 }
 
 function finishAttempt(
@@ -665,7 +715,15 @@ function mapList(
   mapping: ReadonlyMap<number, number>,
   label: string,
 ): number[] {
-  return values.map(value => mapOne(value, mapping, label))
+  const seen = new Set<number>()
+  const mapped: number[] = []
+  for (const value of values) {
+    const next = mapOne(value, mapping, label)
+    if (seen.has(next)) continue
+    seen.add(next)
+    mapped.push(next)
+  }
+  return mapped
 }
 
 function mapOne(

@@ -549,6 +549,68 @@ describe('sessionFormatV1ToV2', () => {
     })
   })
 
+  it('folds v0 streaming assistant snapshots and replacements onto the closed message', () => {
+    const source: SessionFormatArtifact = {
+      header: {
+        version: 1,
+        id: 'v1-assistant-snapshots',
+        createdAt: 1,
+        isSeeded: false,
+        delegationDepth: 0,
+      },
+      inheritedEventCount: 0,
+      events: [
+        event('turn/start', 0, 100, { turn: 1 }),
+        event('step/start', 1, 101, { turn: 1, step: 1 }),
+        event('assistant/chunk', 2, 110, {
+          turn: 1,
+          step: 1,
+          chunk: { type: 'text-delta', index: 0, text: 'hello' },
+        }),
+        event('assistant/chunk', 3, 120, {
+          turn: 1,
+          step: 1,
+          chunk: { type: 'finish', reason: { kind: 'stop' } },
+        }),
+        {
+          ...event('assistant/message', 4, 121, { turn: 1, step: 1, message }),
+          sourceEventSeqs: [2, 3],
+          surfaceOp: 'append',
+        },
+        {
+          ...event('assistant/message', 5, 122, { turn: 1, step: 1, message: { ...message, id: 'assistant-snapshot' } }),
+          surfaceOp: 'append',
+        },
+        {
+          ...event('assistant/message', 6, 123, { turn: 1, step: 1, message: { ...message, id: 'assistant-replace' } }),
+          sourceEventSeqs: [4, 5],
+          surfaceOp: { op: 'replace', start: 4, end: 5 },
+        },
+        event('step/end', 7, 124, { turn: 1, step: 1 }),
+        event('turn/end', 8, 125, { turn: 1, reason: { kind: 'completed' } }),
+        event('command/run', 9, 126, { commandId: 'command-1', name: 'inspect', source: { kind: 'user' } }),
+        event('command/done', 10, 127, {
+          commandId: 'command-1',
+          kind: 'success',
+          sourceEventSeq: 6,
+        }),
+      ],
+    }
+
+    const migrated = migrateV1ToV2(source)
+    expect(migrated.events.filter(candidate => candidate.type === 'assistant/message')).toHaveLength(1)
+    expect(migrated.events).toMatchObject([
+      { type: 'turn/start', seq: 0 },
+      { type: 'step/start', seq: 1 },
+      { type: 'assistant/message', seq: 2, surfaceOp: 'append' },
+      { type: 'step/end', seq: 3 },
+      { type: 'turn/end', seq: 4 },
+      { type: 'command/run', seq: 5 },
+      { type: 'command/done', seq: 6, data: { sourceEventSeq: 2 } },
+    ])
+    expect(migrated.events[2]).not.toHaveProperty('sourceEventSeqs')
+  })
+
   it('retains a failed no-output attempt without fabricating a surface message', () => {
     const failure = { message: 'provider failed', code: 'PROVIDER_ERROR' }
     const source: SessionFormatArtifact = {
